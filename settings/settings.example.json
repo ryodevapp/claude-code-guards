@@ -121,7 +121,8 @@
             "args": [
               "/Users/YOU/.claude/hooks/guard-delete.sh"
             ],
-            "timeout": 10
+            "timeout": 10,
+            "onFailure": "block"
           }
         ]
       },
@@ -134,7 +135,8 @@
             "args": [
               "/Users/YOU/.claude/hooks/guard-write.sh"
             ],
-            "timeout": 10
+            "timeout": 10,
+            "onFailure": "block"
           }
         ]
       }

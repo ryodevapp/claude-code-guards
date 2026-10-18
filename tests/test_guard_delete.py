@@ -156,6 +156,31 @@ class BlocksOutside(unittest.TestCase):
                 with self.subTest(cmd=cmd):
                     self.assertEqual(g.judge(cmd, proj, None, HOME, [TMP], ENV, repo_of=lambda c: proj), [], cmd)
 
+    def test_script_with_delete_given_outside_path_via_variable(self):
+        """H=~; sh s.sh $H のように、同じコマンドの中で変数に入れた外のパスを渡す形も止める(10/19 のレビュー)"""
+        with tempfile.TemporaryDirectory() as d:
+            proj = os.path.realpath(d)
+            os.makedirs(os.path.join(proj, "scripts"))
+            pathlib.Path(proj, "scripts/s.sh").write_text("#!/bin/sh\nrm -rf \"$1\"\n")
+            pathlib.Path(proj, "scripts/ok.sh").write_text("#!/bin/sh\necho \"$1\"\n")
+            pathlib.Path(proj, "tool.py").write_text("import shutil, sys\nshutil.rmtree(sys.argv[2])\n")
+            pj = lambda c: g.judge(c, proj, None, HOME, [TMP], ENV, repo_of=lambda _c: proj)  # noqa: E731
+            for cmd in ["H=~; sh scripts/s.sh $H", 'H=~; sh scripts/s.sh "$H"', "export H=~; sh scripts/s.sh $H",
+                        'H="$HOME"; sh scripts/s.sh $H', "H=/; sh scripts/s.sh $H", 'H=~/Projects; bash scripts/s.sh "${H}"',
+                        "H=~; ./scripts/s.sh $H", "H=~; sh scripts/s.sh $H/x", "local H=~; sh scripts/s.sh $H",
+                        "H=~; python3 tool.py --out $H", "H=~; python3 tool.py --out=$H",
+                        "sh scripts/s.sh $UNKNOWN_XYZ", 'sh scripts/s.sh "$(pwd)"', "sh scripts/s.sh `pwd`",
+                        'D=$(mktemp -d); sh scripts/s.sh "$D/x"',
+                        "sh scripts/s.sh ..", "sh scripts/s.sh ../x", "H=..; sh scripts/s.sh $H"]:
+                with self.subTest(cmd=cmd):
+                    self.assertTrue(pj(cmd), cmd)
+            for cmd in ["sh scripts/s.sh build", "B=build; sh scripts/s.sh $B", 'D=$(mktemp -d); sh scripts/s.sh "$D"',
+                        'D=$(mktemp -d); sh scripts/s.sh "${D:?}/x"', "sh scripts/s.sh $TMPDIR/x",
+                        'sh scripts/s.sh "$PWD/build"', f"H={proj}/build; sh scripts/s.sh $H", "sh scripts/s.sh x..y",
+                        "H=~; sh scripts/ok.sh $H", "H=~; sh scripts/ok.sh ..", "H=~; python3 tool.py --out build"]:
+                with self.subTest(cmd=cmd):
+                    self.assertEqual(pj(cmd), [], cmd)
+
 
 class GlobalScope(unittest.TestCase):
     """全体用: 消してよいのは、いまの場所を含むリポジトリと一時フォルダだけ(2026-10-18)"""

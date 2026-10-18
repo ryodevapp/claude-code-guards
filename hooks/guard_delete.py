@@ -21,7 +21,8 @@
 - bash -c・sh -c・zsh -c・eval の中身、bash・sh・python に渡す heredoc の中身
 - python -c と python の heredoc の shutil.rmtree・os.remove・os.unlink・os.rmdir・Path.unlink・Path.rmdir
   (文字列のパス・Path.home()・expanduser・HOME を見る。mkdtemp・TemporaryDirectory は一時フォルダとみなす)
-- 消す処理を持つスクリプト(python・sh のファイル)に、外のパス(/… ・~…)を引数で渡すとき
+- 消す処理を持つスクリプト(python・sh のファイル)に、外のパス(/… ・~…・.. を含む相対パス)を引数で渡すとき。
+  引数に変数や $(…) があれば広げてから判定し(H=~; sh s.sh $H)、広げられなければ止める
 - cd で動いたあとの相対パス、同じコマンドの中の変数の代入(D=$TMPDIR/x; rm -rf "$D")
 - サンドボックスの外で動かすコマンド(excludedCommands に入れる git push・xcodebuild・xcrun simctl・gh・Tools/test.sh)
   - git push・xcodebuild・Tools/test.sh は、作業の根(GUARD_WRITE_ROOTS。既定は ~/Projects)の直下のリポジトリ
@@ -1361,8 +1362,22 @@ def check_script_file(path_word, args, ctx, lang, unknown_is_problem=False):
         return
     for a in args:
         val = a.split("=", 1)[1] if a.startswith("--") and "=" in a else a
-        if val.startswith(("/", "~", "$HOME", "${HOME}")):
+        if "$" in val or "`" in val or CMDSUB_RE.search(val):
+            # H=~; sh s.sh $H のように、変数や $(…) で外のパスを渡す形。広げてから判定し、
+            # 広げられない(知らない変数・$(…))ときは行き先が分からないので止める
+            p = expand(val, ctx)
+            if p is None:
+                ctx.problems.append(f"消す処理を持つスクリプトに渡す引数の行き先が分からない: {val}")
+                continue
+            if p.startswith(("/", "~")) or _has_parent_ref(p):
+                judge_target(val, ctx, "rm", True)
+        elif val.startswith(("/", "~")) or _has_parent_ref(val):
             judge_target(val, ctx, "rm", True)
+
+
+def _has_parent_ref(p):
+    """.. を含む相対パス(sh s.sh .. や ../x)か。上へ出ると、リポジトリの外を指しうる"""
+    return ".." in p.split("/")
 
 
 def parse_shell_args(args):
