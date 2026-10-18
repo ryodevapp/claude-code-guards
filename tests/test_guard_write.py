@@ -129,6 +129,32 @@ class HookProcess(unittest.TestCase):
     def test_broken_json_blocks(self):
         self.assertEqual(self.run_hook("{not json").returncode, 2)
 
+    def test_odd_input_shapes_exit_2(self):
+        # 判定の途中で落ちると exit 1(公式では非ブロック)になる形。exit 2 で止める(2026-10-19)
+        for payload in ["[]", "1", json.dumps({"tool_name": "Write", "tool_input": "/fake/home/.zshrc"})]:
+            with self.subTest(payload=payload):
+                self.assertEqual(self.run_hook(payload).returncode, 2)
+
+    def test_exception_in_judge_exits_2(self):
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); import guard_write as w\n"
+                "def boom(*a, **k): raise RuntimeError('boom')\n"
+                "w.judge = boom; sys.exit(w.main())")
+        out = self.run_hook(json.dumps({"tool_name": "Write", "tool_input": {"file_path": "/fake/x"}}),
+                            cmd=[sys.executable, "-c", code, str(HOOK.parent)])
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("RuntimeError", out.stderr)
+
+    def test_wrapper_turns_abnormal_exit_into_2(self):
+        # 一時ディレクトリに .sh の写しと壊した python を置いて、.sh が 2 にするかを見る
+        d = pathlib.Path(self.tmp.name, "hooks")
+        d.mkdir()
+        (d / "guard-write.sh").write_text(WRAPPER.read_text())
+        payload = json.dumps({"tool_name": "Write", "tool_input": {"file_path": "/fake/x"}})
+        for body, want in [("def (:\n", 2), ("import sys; sys.exit(1)\n", 2), ("import sys; sys.exit(0)\n", 0)]:
+            with self.subTest(body=body):
+                (d / "guard_write.py").write_text(body)
+                self.assertEqual(self.run_hook(payload, cmd=["/bin/bash", str(d / "guard-write.sh")]).returncode, want)
+
     def test_wrapper_passes_through(self):
         out = self.run_hook(json.dumps({"tool_name": "Write", "tool_input": {"file_path": "/fake/home/.zshrc"}}),
                             cmd=["/bin/bash", str(WRAPPER)])

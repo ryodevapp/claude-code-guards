@@ -17,7 +17,7 @@ python3 -m unittest discover -s tests
 printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"rm -rf ~"}}' "$PWD" | bash hooks/guard-delete.sh; echo "exit=$?"
 ```
 
-2つめはテスト51件(削除用39件・書き込み用12件)です。判定の関数に偽のパス(`/fake/home`)を渡して確かめ、手元のファイルには触れません。テストが自分で作った一時ディレクトリは、終わりに片づきます。
+2つめはテスト67件(削除用52件・書き込み用15件)です。判定の関数に偽のパス(`/fake/home`)を渡して確かめ、手元のファイルには触れません。テストが自分で作った一時ディレクトリは、終わりに片づきます。
 
 3つめは hook に「`rm -rf ~` を打とうとしている」という入力を渡し、`exit=2`(ブロック)が出ます。`rm -rf ~` を `rm -rf build` に変えると、リポジトリの中なので `exit=0`(通す)になります。どちらも文字列を判定するだけで、コマンドは実行しません。ZIP で落として `.git` が無いときは、`rm -rf build` も `exit=2` になります(リポジトリの外なので)。ブロックしたときは理由が標準エラーに出て、Claude にもそのまま見えます。
 
@@ -53,6 +53,9 @@ printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"rm -rf ~"}}' "$P
 - `bash -c`・`bash -lc`・`eval`・`source`・heredoc・`<<<`・`| bash` の中身、`find -exec sh`・`xargs sh`。中身を読めない `source <(…)` は止めます
 - `python -c`(`-Ic` なども)と python の heredoc の `shutil.rmtree`・`os.remove`・`Path.unlink`・`os.system`・`subprocess` の `rm`
 - 削除処理を持つ python・sh のスクリプトに、`/` か `~` で始まる外のパスを引数で渡す呼び方
+- python の削除の行き先が文字列のパスでないもの(`os.path.join(os.sep, …)`・文字列の連結・f 文字列・ループの変数など)。行き先が分からないとしてブロックします
+- `perl -e`・`node -e`・`ruby -e`・`awk`・`swift -e`・`php -r`・`lua -e`・`osascript -e`・`deno eval` の中身(`-E`・`--eval`・`-p` やヒアドキュメントも)。中身は解析せず、削除・移動・コマンド実行らしい語(`rmtree`・`rmSync`・`rm_rf`・`unlink`・`rmdir`・`remove`・`system`・`exec`・バッククォートなど)があればブロックします
+- シンボリックリンクを経由した削除。削除の対象がリンク(か途中がリンク)なら、リンクの先でも判定します。同じコマンドの中で `ln -s` で外を指すリンクを作り、削除・移動もするものはブロックします
 
 破壊的な git 操作(`git reset --hard`・`git clean -f`・`git restore`・`git checkout -- <パス>`・`git checkout HEAD <パス>`・`git switch -f`・`git rm -f`・`git stash drop/clear`・`git worktree remove --force`・`git branch -D`・`git update-ref -d`・`git reflog expire`・`git gc --prune`)と `git -c alias.x='!…'` は、リポジトリの中でもブロックします。まだコミットしていない変更や、どこにも無いコミットが消えるためです。`git restore --staged` や `git checkout main` は通します。
 
@@ -107,8 +110,8 @@ printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"rm -rf ~"}}' "$P
 
 - `excludedCommands` に入れたテストやビルドは、サンドボックスの外で動きます。その中で組み立てて渡すパスは、auto モードの分類器にも hook にも見えません。私は、削除処理のテストを偽のパスか一時ディレクトリだけで書くルールにしています。一時ディレクトリは `set -eu` と `"${D:?}"` の形で使い、作るのに失敗したら止まるようにします
 - `excludedCommands` のパターンは広くなりがちです。hook は危ない形(`simctl spawn` など)を止めますが、シミュレーターに入れて動かすアプリ(`simctl install`・`launch`)、Xcode の Run Script、`xcodebuild` に渡すビルド設定の中身は見ません。`gh pr merge`・`gh workflow run` も、場所は確かめますが中身は止めていません。GitHub の、自分のものでないリポジトリへの push も通ります
-- 削除用の hook がまだ判定しない書き方: `perl -e`・`node -e`・`ruby -e`・`awk`・`swift -e` の中の削除、`os.path.join(os.sep, …)` や文字列の連結のように文字列に現れないパス、シンボリックリンクを経由した削除(`find -L` など)、作業ディレクトリが一時ディレクトリのときの BSD の `find -f <パス>`、上書き(リダイレクト・`cp`・`sed -i`・`truncate`)。サンドボックスの中で動くので、外への書き込みは②が防ぎます
-- hook が失敗・タイムアウトすると、Claude Code はそのまま処理を進めます。公式の記述では、v2.1.295 以降なら hook に `"onFailure": "block"` を足すとブロックされます(私の版では試していません)
+- 削除用の hook がまだ判定しない書き方: perl・node などのスクリプトのファイルの中で組み立てるパス、`chr()` や `pack` で語を組み立てて隠す書き方、awk の `print > "ファイル"` による上書き、作業ディレクトリが一時ディレクトリのときの BSD の `find -f <パス>`、上書き(リダイレクト・`cp`・`sed -i`・`truncate`)。サンドボックスの中で動くので、外への書き込みは②が防ぎます
+- hook がタイムアウトすると、Claude Code はそのまま処理を進めます(判定の途中で例外が出たときと、python が異常終了したときは、exit 2 にしてブロックします)。公式の記述では、v2.1.295 以降なら hook に `"onFailure": "block"` を足すとブロックされます(私の版では試していません)
 
 ここに無い穴を見つけた方は、Issue で教えてください。
 
@@ -118,12 +121,12 @@ Two PreToolUse hooks, tests, and example settings for Claude Code, written after
 
 - `guard-delete` (Bash and Monitor) blocks (exit 2) commands that delete or move files outside two places: the git repository containing the command's working directory, and the temp directories. It also blocks commands whose target it cannot resolve, unreadable hook input, the main git commands that discard uncommitted work or unmerged commits, and risky forms of commands that run outside the sandbox (`git push` to anything but a remote name or a GitHub URL, `xcrun simctl spawn`, destructive `gh` subcommands, `gh repo clone -- <git args>`, and `git push`/`xcodebuild`/git-running `gh` subcommands outside real repositories directly under `~/Projects`).
 - `guard-write` (Edit, Write, MultiEdit, NotebookEdit) blocks writes outside git repositories under `~/Projects` (change with `GUARD_WRITE_ROOTS`) and the temp directories, and blocks writes to `.git` and to config that can run code outside the sandbox (`.claude/`, `.mcp.json`, `.husky/`, `.githooks/`, `.vscode/`, …).
-- 51 tests. They never touch your files; they only use fake paths and their own temp folders.
+- 67 tests. They never touch your files; they only use fake paths and their own temp folders.
 - Tested on macOS only (Claude Code 2.1.292, python3 3.9.6 and 3.12). On Linux and WSL2, wildcards in `allowWrite`/`denyWrite`, and in the paths that `Edit(...)` rules add to the sandbox, have no effect (the rules still apply to the Edit tool).
 
 Quick try: run the three commands above. `exit=2` means blocked.
 
-What each layer does **not** stop: the sandbox does not cover the Read/Edit/Write tools, MCP servers, hooks or `excludedCommands`. Deny rules miss other spellings such as `/bin/rm` or `bash -c`. The hooks do not see paths built inside tests and scripts, deletions in perl/node/ruby, or overwrites by redirection, `cp` or `sed -i`.
+What each layer does **not** stop: the sandbox does not cover the Read/Edit/Write tools, MCP servers, hooks or `excludedCommands`. Deny rules miss other spellings such as `/bin/rm` or `bash -c`. The hooks do not see paths built inside tests and script files, or overwrites by redirection, `cp` or `sed -i`. Inline perl/node/ruby/awk/swift code is blocked when it contains deletion-like words rather than parsed.
 
 ## License
 

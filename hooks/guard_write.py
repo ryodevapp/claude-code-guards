@@ -106,10 +106,23 @@ def judge(file_path, home, temp_roots, work_roots, exists=os.path.exists, real=_
 
 
 def main():
+    """想定外の例外で落ちると exit 1 になり、Claude Code は書き込みを止めない(公式: exit 2 だけがブロック)。
+    なので判定の全体を包み、落ちたら理由を出して exit 2 にする"""
+    try:
+        return _main()
+    except Exception as e:
+        sys.stderr.write(f"{MSG}: hook が確かめる途中で失敗した({type(e).__name__}: {e})ので、止める。{HINT}\n")
+        return 2
+
+
+def _main():
     try:
         data = json.load(sys.stdin)
     except Exception:
         sys.stderr.write(f"{MSG}: hook への入力の JSON をパースできないので、書く先を確かめられない。止める\n")
+        return 2
+    if not isinstance(data, dict):
+        sys.stderr.write(f"{MSG}: hook への入力の形が違うので、書く先を確かめられない。止める\n")
         return 2
     if data.get("tool_name") not in TOOLS:
         return 0

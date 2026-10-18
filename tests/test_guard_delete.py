@@ -488,5 +488,200 @@ class DiscardAndWrappers(unittest.TestCase):
                 self.assertEqual(problems(cmd), [], cmd)
 
 
+WRAPPER = ROOT / "hooks/guard-delete.sh"
+
+
+class CrashBlocks(unittest.TestCase):
+    """判定の途中で落ちても exit 2 で止める(exit 1 は公式では非ブロックで、コマンドが動いてしまう)(2026-10-19)"""
+
+    def run_code(self, code, payload):
+        return subprocess.run([sys.executable, "-c", code, str(HOOK.parent)], input=payload, text=True,
+                              capture_output=True, timeout=30,
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+
+    def test_exception_in_judge_exits_2(self):
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); import guard_delete as g\n"
+                "def boom(*a, **k): raise RuntimeError('boom')\n"
+                "g.judge = boom; sys.exit(g.main())")
+        r = self.run_code(code, json.dumps({"tool_name": "Bash", "cwd": "/", "tool_input": {"command": "ls"}}))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("RuntimeError", r.stderr)
+
+    def test_odd_input_shapes_exit_2(self):
+        for payload in ["[]", "1", json.dumps({"tool_name": "Bash", "tool_input": "rm -rf x"})]:
+            with self.subTest(payload=payload):
+                r = subprocess.run([sys.executable, str(HOOK)], input=payload, text=True, capture_output=True,
+                                   timeout=30, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                self.assertEqual(r.returncode, 2, r.stderr)
+
+    def test_wrapper_turns_abnormal_exit_into_2(self):
+        # 一時フォルダに hook の写しを作り、python の側を壊して(構文エラー・exit 1)、.sh が 2 にするかを見る
+        with tempfile.TemporaryDirectory() as d:
+            sh = pathlib.Path(d, "guard-delete.sh")
+            sh.write_text(WRAPPER.read_text())
+            payload = json.dumps({"tool_name": "Bash", "cwd": d, "tool_input": {"command": "ls"}})
+            for body, want in [("def (:\n", 2), ("import sys; sys.exit(1)\n", 2), ("import sys; sys.exit(0)\n", 0),
+                               ("import sys; sys.exit(2)\n", 2)]:
+                with self.subTest(body=body):
+                    pathlib.Path(d, "guard_delete.py").write_text(body)
+                    r = subprocess.run(["/bin/bash", str(sh)], input=payload, text=True, capture_output=True,
+                                       timeout=30, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                    self.assertEqual(r.returncode, want, r.stderr)
+
+    def test_wrapper_passes_real_results(self):
+        for cmd, want in [("rm -rf /fake/home/Projects", 2), ("ls", 0)]:
+            with self.subTest(cmd=cmd):
+                r = subprocess.run(["/bin/bash", str(WRAPPER)], text=True, capture_output=True, timeout=30,
+                                   input=json.dumps({"tool_name": "Bash", "cwd": "/", "tool_input": {"command": cmd}}),
+                                   env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                self.assertEqual(r.returncode, want, r.stderr)
+
+
+class OtherLanguages(unittest.TestCase):
+    """perl -e・node -e・ruby -e・awk・swift -e などの中の削除。中身は解析せず、消す・動かす語があれば止める(2026-10-19)"""
+
+    def test_blocks(self):
+        cases = [
+            "perl -e 'use File::Path; rmtree(\"/fake/home\")'", "perl -MFile::Path=remove_tree -e 'remove_tree($ARGV[0])' ~",
+            "perl -e 'unlink glob(\"~/*\")'", "perl -e 'system(\"r\".\"m -rf ~\")'", "perl -e 'print `ls`'",
+            "perl -E 'rmdir $x'", "perl -lne 'unlink'", "perl5.34 -e 'unlink q(/fake/home/x)'", "env perl -e 'unlink 1'",
+            "perl <<'EOF'\nunlink '/fake/home/x';\nEOF", "echo 'print 1' | perl", "bash -c \"perl -e 'unlink 1'\"",
+            "ruby -e 'require \"fileutils\"; FileUtils.rm_rf(Dir.home)'", "ruby -rfileutils -e 'FileUtils.rm_r(ENV[\"HOME\"])'",
+            "ruby -e 'File.delete(x)'", "ruby -e '%x{ls}'",
+            "node -e \"require('fs').rmSync(require('os').homedir(), {recursive: true})\"",
+            "node --eval=\"require('child_process').execSync('ls')\"", "node -p \"require('fs').unlinkSync('/x')\"",
+            "node --eval \"fs.rmdirSync(p)\"", "bun -e 'await Bun.$`ls`'",
+            "deno eval 'Deno.removeSync(Deno.env.get(\"HOME\"), {recursive: true})'",
+            "awk 'BEGIN{system(\"ls\")}'", "awk 'BEGIN{print \"x\" | \"sh\"}'", "gawk -e 'BEGIN{system(\"x\")}'",
+            "awk -F: 'BEGIN{\"date\" | getline d}'",
+            "swift -e 'import Foundation; try FileManager.default.removeItem(atPath: NSHomeDirectory())'",
+            "osascript -e 'do shell script \"ls\"'",
+            "osascript -e 'tell application \"Finder\" to delete POSIX file \"/fake/home/x\"'",
+            "osascript -l JavaScript -e 'app.doShellScript(\"ls\")'",
+            "php -r 'unlink(getenv(\"HOME\").\"/.zshrc\");'", "lua -e 'os.remove(os.getenv(\"HOME\"))'",
+            "perl -e 'alarm 30; exec @ARGV' rm -rf ~/Documents", "perl -e 'alarm 5; exec @ARGV' bash -c 'rm -rf ~'",
+            "awk '{print $0 | cmd}' f", "awk '{print > \"/dev/stderr\"; print | \"sh\"}'",
+            # 引用符の無いヒアドキュメントの本文の $(…) は展開されるので、これまでどおり見る
+            "cat > notes.md <<EOF\n$(rm -rf ~/Documents)\nEOF",
+            # 引用符つきでも、bash・python に渡す本文はこれまでどおり中身を見る
+            "bash <<'EOF'\nrm -rf $(echo ~)\nEOF", "python3 - <<'EOF'\nimport os\nos.system('rm -rf ~')\nEOF",
+        ]
+        for cmd in cases:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(problems(cmd), cmd)
+
+    def test_allows(self):
+        cases = [
+            "perl -ne 'print if /foo/' file.txt", "perl -pi -e 's/foo/bar/g' src/a.txt", "perl -i.bak -pe 's/a/b/' x",
+            "perl -v", "perl -e 'printf(\"%x\\n\", 255)'", "ruby -v", "ruby -e 'puts 1'",
+            "awk '{print $1}' file", "awk -F: '{delete a[$1]} END{print NR}' /etc/passwd",
+            "awk 'NR>1 || NF==0 {print}' f", "awk -v x=1 'BEGIN{print x}'",
+            "node -p 'process.versions.node'", "node --version", "node -v",
+            "swift -e 'print(1)'", "osascript -e 'display notification \"x\"'", "python3 --version", "python3 -V",
+            "git log --format='%h %s' | awk '{print $1}'",
+            # 時間切れの包み(後ろのコマンドを見る)・awk の正規表現の |・引用符つきヒアドキュメントの中の `…`
+            "perl -e 'alarm 30; exec @ARGV' xcrun simctl uninstall X com.example.app",
+            "C=$(perl -e 'alarm 30; exec @ARGV' xcrun simctl get_app_container X com.example.app data); echo $C",
+            "awk '/^## a|^### b/{f=1} f{print}' docs/a.md | head", "awk 'NR>=93 && /^\\| /{l=NR} END{print l}' a.md",
+            "cat > notes.md <<'EOF'\n`osascript` と `perl` と `$(rm -rf ~)` は書くだけ\nEOF",
+        ]
+        for cmd in cases:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(problems(cmd), [], cmd)
+
+    def test_script_file_with_delete_given_outside_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            proj = os.path.realpath(d)
+            pathlib.Path(proj, "clean.pl").write_text("use File::Path; rmtree($ARGV[0]);\n")
+            pathlib.Path(proj, "hello.js").write_text("console.log(1)\n")
+            pj = lambda c: g.judge(c, proj, None, HOME, [TMP], ENV, repo_of=lambda _c: proj)  # noqa: E731
+            self.assertTrue(pj("perl clean.pl /fake/home"))
+            self.assertEqual(pj("perl clean.pl build"), [])
+            self.assertEqual(pj("node hello.js /fake/home"), [])
+
+
+class PythonComputedPaths(unittest.TestCase):
+    """python で消す行き先が文字列のパスでない(os.path.join・連結・変数・f 文字列)ときは止める(2026-10-19)"""
+
+    def test_blocks(self):
+        cases = [
+            "python3 -c 'import shutil,os; shutil.rmtree(os.path.join(os.sep, \"fake\", \"home\"))'",
+            "python3 -c 'import shutil; shutil.rmtree(\"build\" + \"/../..\")'",
+            "python3 -c 'import shutil; p = \"build\"; shutil.rmtree(p + \"/../..\")'",
+            "python3 -c 'import os; [os.remove(f) for f in os.listdir(\".\")]'",
+            "python3 -c 'import shutil; shutil.rmtree(f\"build/{x}\")'",
+            "python3 -c 'import shutil,sys; d = sys.argv[1]; d += \"/..\"; shutil.rmtree(d)' build",
+            "python3 -c 'from pathlib import Path; Path.cwd().parent.joinpath(\"x\").unlink()'",
+            "python3 -c 'import os,shutil; shutil.rmtree(os.getcwd())'",
+            "python3 - <<'EOF'\nimport os, shutil\nfor d in os.listdir('..'):\n    shutil.rmtree(d)\nEOF",
+            "python3 - <<'EOF'\nimport shutil\ndef wipe(p):\n    shutil.rmtree(p)\nwipe('/x')\nEOF",
+            "python3 -c 'import shutil; shutil.rmtree(path=os.sep)'",
+        ]
+        for cmd in cases:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(problems(cmd), cmd)
+
+    def test_allows(self):
+        cases = [
+            "python3 -c \"import shutil; shutil.rmtree('build/x', ignore_errors=True)\"",
+            "python3 -c \"import shutil; d = 'build/x'; shutil.rmtree(d)\"",
+            "python3 -c \"from pathlib import Path; Path('build/a.txt').unlink(missing_ok=True)\"",
+            "python3 -c \"from pathlib import Path; p = Path('build/a'); p.rmdir()\"",
+            "python3 - <<'EOF'\nimport shutil, tempfile\nwith tempfile.TemporaryDirectory() as d:\n    shutil.rmtree(d)\nEOF",
+            "python3 -c 'import shutil,sys; shutil.rmtree(sys.argv[1])' build",
+            "python3 -c \"import os; p = 'build/x.txt'; os.remove(p)\"",
+        ]
+        for cmd in cases:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(problems(cmd), [], cmd)
+
+
+class Symlinks(unittest.TestCase):
+    """リンクを通る削除は、リンクの先で判定する。同じコマンドで外を指すリンクを作って消す形も止める(2026-10-19)"""
+
+    def setUp(self):
+        # 一時フォルダの中にだけ、リポジトリ役と外役のフォルダとリンクを作る(何も消さない。判定するだけ)
+        self._d = tempfile.TemporaryDirectory()
+        self.addCleanup(self._d.cleanup)
+        base = os.path.realpath(self._d.name)
+        self.proj = os.path.join(base, "proj")
+        self.out = os.path.join(base, "outside")
+        os.makedirs(os.path.join(self.proj, "sub"))
+        os.makedirs(os.path.join(self.out, "x"))
+        os.symlink(self.out, os.path.join(self.proj, "l"))
+        os.symlink(base, os.path.join(self.proj, "via"))
+        os.symlink(os.path.join(self.proj, "sub"), os.path.join(self.proj, "inner"))
+
+    def pj(self, cmd):
+        proj = self.proj
+        return g.judge(cmd, proj, None, HOME, [TMP], ENV,
+                       repo_of=lambda c: proj if c == proj or c.startswith(proj + "/") else None)
+
+    def test_real_links_blocked(self):
+        for cmd in ["rm -rf l", "rm -rf l/", "rm -rf l/*", "rm -rf l/x", "find l -delete", "find l -name '*.o' -delete",
+                    "rm -rf via/outside", "mv l/x build/x", "rsync -a --delete src/ l"]:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self.pj(cmd), cmd)
+
+    def test_inside_links_allowed(self):
+        for cmd in ["rm -rf inner", "rm -rf inner/x", "rm -rf sub", "find inner -delete", "rm -rf via/proj/sub"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.pj(cmd), [], cmd)
+
+    def test_ln_in_same_command_blocked(self):
+        for cmd in ["ln -s ~ x && rm -rf x/Projects", "ln -s /fake/home/Documents d; rm -rf d/", "ln -sf ~ x; rm -rf x/*",
+                    "ln -s ~/Documents d && find d -delete", "ln -s ~ x && mv x/a build/", 'ln -s "$HOME" x && rm -rf x',
+                    "cd build && ln -s ../../ up && rm -rf up/home", "ln -s $UNKNOWN_X x && rm -rf x/",
+                    "ln -s --symbolic ~ x; rm -rf x", "ln -s /fake/home links/ && rm -rf links/home/a"]:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(problems(cmd), cmd)
+
+    def test_ln_allowed(self):
+        for cmd in ["ln -s ~/Documents d", "ln -s ../shared x", "ln -s src/a.txt b.txt && rm -f c.txt",
+                    "ln -sf /fake/tmp/x cache && rm -rf build", "ln a b && rm -f c"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(problems(cmd), [], cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

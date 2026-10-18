@@ -32,6 +32,15 @@
 - リポジトリの中でも変更やコミットを捨てる git(switch -f・checkout <rev> <パス>・rm -f・update-ref -d・reflog expire・
   gc --prune)、git -c alias.x='!…'
 - env -S・arch・script・xcrun の後ろのコマンド
+- 2026-10-19 に足したもの
+  - perl・ruby・node・bun・deno eval・awk・swift・php・lua・osascript の -e(-E・--eval・-p・-r など)の中身と
+    ヒアドキュメント: 解析せず、消す・動かす・コマンドを動かす語(rmtree・rmSync・rm_rf・unlink・rmdir・remove・
+    system・exec・`…` など)があれば止める。perl -e 'alarm N; exec @ARGV' は後ろのコマンドを見る
+  - python の消す処理の行き先が文字列のパスでない(os.path.join・連結・f 文字列・ループの変数など)ときは止める
+  - 消す対象がシンボリックリンク(か途中がリンク)なら、リンクの先でも判定する。同じコマンドの中で ln -s で
+    外を指すリンクを作り、消す・動かす処理もあるものは止める
+  - 判定の途中で落ちたら exit 2(exit 1 は公式では非ブロック)。guard-delete.sh も python の異常終了を 2 にする
+  - <<'EOF' の本文(シェルが展開しない)の中の $(…)・`…` はコマンドとして見ない
 
 止めないもの: 読むだけのコマンド、リポジトリの中の rm・mv、一時フォルダの中の rm・mv。
 判定は文字列だけで行い、ファイルを消したり書いたりしない(読むのは、消す処理を持つかを見るスクリプトと、
@@ -59,6 +68,11 @@ DELETE_HINT_RE = re.compile(
 def delete_hint(cmd):
     """消す処理らしい文字を含むか。r\\m や "r""m" のような書き方でも当たるよう、引用符と \\ を外した文字にも当てる"""
     return bool(DELETE_HINT_RE.search(cmd) or DELETE_HINT_RE.search(re.sub(r"[\\'\"]", "", cmd)))
+
+
+def _risky(cmd):
+    """消す処理か、ほかの言語で消す・コマンドを動かす処理らしい文字を含むか(読めないときに止めるかの目安)"""
+    return delete_hint(cmd) or bool(INTERP_DELETE_RE.search(cmd))
 
 
 ANSI_C_RE = re.compile(r"\$'((?:\\.|[^'\\])*)'")
@@ -165,6 +179,8 @@ class Ctx:
         self.mktemp_vars = set()  # D=$(mktemp -d) で決めた変数。失敗すると空になる
         self.cmdsubs = []
         self.problems = []
+        self.links = {}  # 同じコマンドの中で ln -s で作るリンク(リンクの場所 → 指す先)
+        self.full_cmd = ""
         raw = self.env.get("GUARD_WRITE_ROOTS") or (os.path.join(home, "Projects") if home else "")
         self.work_roots = [_real(r) for r in raw.split(":") if r]
         self.dev_dir = _real(os.path.join(home, "Library/Developer")) if home else None
@@ -256,6 +272,7 @@ def expand(word, ctx, whole_ok=True):
 
 
 def resolve(path, ctx, follow_last=False):
+    """パスの実体。途中のリンクはたどる。最後の名前は、follow_last か末尾の / のときだけたどる"""
     if not os.path.isabs(path):
         if not ctx.cwd:
             return None
@@ -263,9 +280,34 @@ def resolve(path, ctx, follow_last=False):
     trailing = path.endswith("/")
     path = os.path.normpath(path)
     base = os.path.basename(path)
-    if follow_last or trailing or base in ("", ".", ".."):
-        return _real(path)
-    return os.path.join(_real(os.path.dirname(path)), base)
+    follow = follow_last or trailing or base in ("", ".", "..")
+    out = _real(path) if follow else os.path.join(_real(os.path.dirname(path)), base)
+    return _through_links(out, ctx, follow)
+
+
+def _through_links(r, ctx, follow):
+    """同じコマンドの中で ln -s で作ったリンクを通るパスを、リンクの指す先に置き換える
+    (まだ作られていないので realpath ではたどれない)"""
+    for _ in range(8):
+        for link, target in ctx.links.items():
+            if _inside(r, link, strict=True):
+                r = os.path.normpath(target + r[len(link):])
+                break
+            if follow and r == link:
+                r = target
+                break
+        else:
+            return r
+    return r
+
+
+def link_target(r, ctx):
+    """r がリンク(本物か、同じコマンドの中で作るもの)なら、指す先の実体を返す"""
+    if r in ctx.links:
+        return ctx.links[r]
+    if os.path.islink(r):
+        return _real(r)
+    return None
 
 
 def judge_target(word, ctx, kind="rm", recursive=True):
@@ -287,15 +329,23 @@ def judge_target(word, ctx, kind="rm", recursive=True):
             return
         _judge_dir_children(word, d, ctx, recursive, kind_glob=True)
         return
-    r = resolve(p, ctx)
+    dir_kind = kind.startswith("find") or kind == "rsync"
+    r = resolve(p, ctx, follow_last=dir_kind)  # find -L・rsync の行き先はリンクの先を消す
     if r is None:
         ctx.problems.append(f"行き先が分からない(cd のあと): {word}")
         return
-    if kind.startswith("find") or kind == "rsync":
+    if dir_kind:
         filtered = {"find-filtered": True, "find-keeps-git": "keeps-git"}.get(kind, False)
         _judge_dir_children(word, r, ctx, recursive, filtered=filtered)
         return
     _judge_path(word, r, ctx)
+    t = link_target(r, ctx)
+    if t is not None and t != r:
+        # 対象がリンクなら、指す先でも判定する(rm -r link/ や、あとで中身を消す形でリンクの先が消えるため)
+        n = len(ctx.problems)
+        _judge_path(word, t, ctx)
+        if len(ctx.problems) > n:
+            ctx.problems[-1] = f"リンクの先が外: {word} → {t}"
 
 
 def _git_dir_problem(r, ctx):
@@ -348,11 +398,43 @@ def _judge_dir_children(word, d, ctx, recursive, filtered=False, kind_glob=False
 
 # ---- コマンドを読む ----
 
+def _literal_heredoc_ranges(cmd):
+    """<<'EOF'・<<"EOF" の本文(シェルが展開しない所)の (始め, 終わり) の一覧"""
+    ranges, pos = [], 0
+    lines = cmd.split("\n")
+    k = 0
+    offsets = []
+    for line in lines:
+        offsets.append(pos)
+        pos += len(line) + 1
+    while k < len(lines):
+        marks = [m for m in HEREDOC_RE.finditer(lines[k])]
+        k += 1
+        for m in marks:
+            dash, quoted, word = m.group(1), m.group(2), m.group(3)
+            start = offsets[k] if k < len(lines) else pos
+            stop = pos  # 終わりの行が無ければ、最後まで本文
+            while k < len(lines):
+                end = lines[k].lstrip("\t") if dash else lines[k]
+                k += 1
+                if end.strip() == word:
+                    stop = offsets[k - 1]
+                    break
+            if quoted and stop > start:
+                ranges.append((start, stop))
+    return ranges
+
+
 def strip_cmdsubs(cmd, ctx):
     """$(...) と `...` を置き換える(中身は別のコマンドとしても見る)"""
     out, i, n = [], 0, len(cmd)
     inner = []
+    skips = dict(_literal_heredoc_ranges(cmd)) if "<<" in cmd else {}
     while i < n:
+        if i in skips:
+            out.append(cmd[i:skips[i]])
+            i = max(skips[i], i + 1)
+            continue
         if cmd.startswith("$(", i) and not cmd.startswith("$((", i):
             depth, j = 1, i + 2
             while j < n and depth:
@@ -828,6 +910,39 @@ def check_gh(args, ctx):
                 ctx.problems.append(f"gh に渡すファイルの実体(リンクの先)がリポジトリと一時フォルダの外: {v}")
 
 
+def check_ln(args, ctx):
+    """ln -s: 外を指すリンクを覚える(あとの rm・mv はリンクの先で判定する)。
+    同じコマンドの中に消す・動かす処理があれば、外を指すリンクを作る時点で止める"""
+    opts, pos = split_opts(args)
+    symbolic = any(o == "--symbolic" or (not o.startswith("--") and "s" in o[1:]) for o in opts)
+    if not symbolic or not pos:
+        return
+    no_deref = any(o in ("--no-dereference", "--no-target-directory") or
+                   (not o.startswith("--") and ("n" in o[1:] or "h" in o[1:] or "T" in o[1:])) for o in opts)
+    risky = _risky(ctx.full_cmd)
+    srcs, dest = (pos[:-1], pos[-1]) if len(pos) >= 2 else (pos, ".")
+    dp = expand(dest, ctx)
+    d = resolve(dp, ctx) if dp is not None else None
+    if d is None:
+        if risky:
+            ctx.problems.append(f"ln -s で作るリンクの場所が分からない: {dest}")
+        return
+    into_dir = len(srcs) > 1 or dest.endswith("/") or (not no_deref and os.path.isdir(_real(d)))
+    for src in srcs:
+        sp = expand(src, ctx)
+        link = os.path.join(_real(d), os.path.basename(os.path.normpath(sp or src))) if into_dir else d
+        if sp is None:
+            if risky:
+                ctx.problems.append(f"ln -s で作るリンクの指す先が分からない: {src}")
+            continue
+        if sp == "~" or sp.startswith("~/"):
+            sp = (ctx.home or "") + sp[1:]
+        target = _real(sp if os.path.isabs(sp) else os.path.join(os.path.dirname(link), sp))
+        ctx.links[link] = target
+        if risky and not any(_inside(target, root, strict=True) for root in ctx.roots()):
+            ctx.problems.append(f"同じコマンドの中で、外を指すリンクを作ってから消す・動かす形: {src} → {target}")
+
+
 def check_mv(args, ctx):
     """動かす元と行き先が、どちらもリポジトリか一時フォルダの中か"""
     opts, targets = split_opts(args)
@@ -879,6 +994,167 @@ def check_python_shell(code, ctx):
             judge_command(" ".join(shlex.quote(x) for x in lits), ctx)
 
 
+# ---- python 以外の言語(perl -e・node -e・ruby -e・awk・swift -e など) ----
+# 中身は解析しない。消す・動かす・外のコマンドを動かす処理らしい語があれば「行き先が分からない」として止める。
+INTERP_DELETE_RE = re.compile(
+    r"rmtree|remove_tree|rmSync|rm_rf|\brm_r\b|\brm_f\b|\bFileUtils\b|\bunlink|\brmdir|\bremove|\btrash|"
+    r"(?:\bFile|\bDir|\bPathname)\.delete\b|\bdelete\s+(?:POSIX\s+)?(?:file|folder|alias|item|every|disk)\b|"
+    r"\brename|moveItem|\bmv\b|\brm\b|symlink|"
+    r"\bsystem\b|\bexec(?:Sync|File|FileSync|v|vp|vpe|l|lp|le|ve)?\b|\bspawn|\bpopen\b|child_process|\bProcess\b|\bqx\b|%x[{(\[<]|\bdo shell script\b|doShellScript|"
+    r"\bshell_exec\b|\bpassthru\b|\bproc_open\b|\bpcntl_exec\b|\bDeno\.(?:remove|run|Command)\b|\bBun\.(?:spawn|\$)"
+)
+# awk の delete arr[i] は配列の操作なので見ない。system() と、コマンドへのパイプ(print | "sh"・"cmd" | getline)を見る
+AWK_DELETE_RE = re.compile(r"\bsystem\s*\(|\|&|\|\s*\"|\|\s*getline\b|\bprintf?\b[^;{}/]*\|\s*[A-Za-z_(]|"
+                           r"\brm\b|\bunlink\b|\brmdir\b")
+PERL_TIMEOUT_RE = re.compile(r"\s*alarm\s*\(?\s*\d+\s*\)?\s*;\s*exec\s*\{?\s*(?:\$ARGV\[0\]\s*\}?\s*)?@ARGV\s*;?\s*"
+                             r"(?:or\s+die[^;]*;?\s*)?")
+AWKS = {"awk", "gawk", "mawk", "nawk", "busybox-awk"}
+# (名前, 中身を取る短いフラグの文字, 後ろに値を取る(くっつけて書く)フラグの文字, 長いフラグ, 決まった形だけのフラグ)
+INTERPS = {
+    "perl": ("eE", "iIMmxCdDF", ("--eval",), ()),
+    "ruby": ("e", "IrCFiKTWxE", (), ()),
+    "node": ("ep", "r", ("--eval", "--print"), ()),
+    "nodejs": ("ep", "r", ("--eval", "--print"), ()),
+    "bun": ("ep", "r", ("--eval", "--print"), ()),
+    "swift": ("", "", (), ("-e",)),
+    "php": ("", "", (), ("-r", "-R", "-B", "-E")),
+    "lua": ("e", "l", (), ()),
+    "luajit": ("e", "l", (), ()),
+    "osascript": ("", "", (), ("-e",)),
+}
+VALUE_FLAGS = {"osascript": ("-l", "-s", "-i"), "php": ("-c", "-d", "-z")}
+
+
+def _interp_name(name):
+    """perl5.30・ruby3.3・node22 のような版つきの名前も同じ言語として見る"""
+    if name in INTERPS or name in AWKS:
+        return name
+    m = re.fullmatch(r"(perl|ruby|node|php|lua)[\d.]*", name)
+    return m.group(1) if m else None
+
+
+def _interp_codes(lang, args):
+    """引数から、その場で動かすコード(-e の中身など)を集める。(コード, 最初の位置引数) を返す"""
+    if lang in AWKS:
+        codes, i, has_file = [], 0, False
+        while i < len(args):
+            a = args[i]
+            if a == "--":
+                i += 1
+                break
+            if not a.startswith("-") or a == "-":
+                break
+            if a in ("-f", "--file", "-e", "--source", "-F", "-v", "--assign", "-i", "--include", "-l", "--load"):
+                if a in ("-f", "--file", "-i", "--include", "-l", "--load"):
+                    has_file = True  # 読み込むプログラムのファイル
+                if a in ("-e", "--source") and i + 1 < len(args):
+                    codes.append(args[i + 1])
+                i += 2
+                continue
+            if a.startswith(("--source=", "--file=")):
+                if a.startswith("--source="):
+                    codes.append(a.split("=", 1)[1])
+                else:
+                    has_file = True
+            elif a.startswith("-f"):
+                has_file = True
+            i += 1
+        if not codes and not has_file and i < len(args):
+            codes.append(args[i])  # awk 'プログラム' ファイル…
+        return codes, None, has_file
+    letters, params, longs, exact = INTERPS[lang]
+    codes, first_pos, i = [], None, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            break
+        if a in VALUE_FLAGS.get(lang, ()):
+            i += 2  # 値を1つ取るフラグ(osascript -l JavaScript など)
+            continue
+        if a in exact:
+            if i + 1 < len(args):
+                codes.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("--"):
+            key, eq, val = a.partition("=")
+            if key in longs:
+                if eq:
+                    codes.append(val)
+                elif i + 1 < len(args):
+                    codes.append(args[i + 1])
+                    i += 1
+            i += 1
+            continue
+        if a.startswith("-") and len(a) > 1 and letters:
+            flags = a[1:]
+            for k, c in enumerate(flags):
+                if c in letters:
+                    tail = flags[k + 1:]
+                    if tail:
+                        codes.append(tail)
+                    elif i + 1 < len(args):
+                        codes.append(args[i + 1])
+                        i += 1
+                    break
+                if c in params:
+                    break
+            i += 1
+            continue
+        if not a.startswith("-") and first_pos is None:
+            first_pos = a
+        i += 1
+    return codes, first_pos, False
+
+
+def check_interp(name, args, ctx, heredoc_body=None, here=None, infile=None):
+    """perl -e・node -e・ruby -e・awk・swift -e などの中の、消す・動かす処理らしい語を見る"""
+    lang = _interp_name(name)
+    if name == "deno" or lang is None:
+        if name == "deno" and args[:1] == ["eval"]:
+            lang, codes, first_pos, has_file = "deno", args[1:2], None, False
+        else:
+            return
+    else:
+        codes, first_pos, has_file = _interp_codes(lang, args)
+    regex = AWK_DELETE_RE if lang in AWKS else INTERP_DELETE_RE
+    if lang in ("perl", "ruby", "php"):
+        regex = re.compile(regex.pattern + r"|`")  # perl・ruby・php のバッククォートはシェルのコマンドを動かす
+    if not codes and lang not in AWKS:
+        if heredoc_body is not None:
+            codes = [heredoc_body]
+        elif here is not None:
+            codes = [here]
+        elif first_pos is not None:
+            check_script_file(first_pos, args[args.index(first_pos) + 1:], ctx, "interp")
+            return
+        elif infile is not None:
+            check_script_file(infile, [], ctx, "interp", unknown_is_problem=True)
+            return
+        elif not [a for a in args if a != "-"]:  # 引数なし(か - だけ)で、パイプから読む形
+            ctx.problems.append(f"{name} が標準入力(| {name} など)から読むコードは、中身を確かめられない")
+            return
+    if lang == "perl" and len(codes) == 1 and PERL_TIMEOUT_RE.fullmatch(codes[0]) and codes[0] in args:
+        # 時間切れの包み(alarm N; exec @ARGV): 後ろの引数がそのままコマンドになるので、それを見る
+        rest = args[args.index(codes[0]) + 1:]
+        if rest and rest[0] == "--":
+            rest = rest[1:]
+        if rest:
+            check_segment(rest, ctx)
+        return
+    for code in codes:
+        if lang in ("perl", "ruby", "php") and CMDSUB_RE.search(code):
+            # 引用符の中の `…` も、読むときに先に取り出している(印が残る)。perl・ruby・php ではシェルを動かす
+            ctx.problems.append(f"{name} の中のコードに `…`(シェルのコマンドを動かす)があり、行き先が分からない")
+            return
+        m = regex.search(code)
+        if m:
+            ctx.problems.append(f"{name} の中のコードに、消す・動かす・ほかのコマンドを動かす処理らしい語"
+                                f"({m.group(0).strip()})があり、行き先が分からない。シェルの rm・mv に書き直すか、"
+                                "python なら文字列のパスで書く")
+            return
+
+
 def check_python_code(code, argv_rest, ctx):
     check_python_shell(code, ctx)
     pats = [PY_DELETE_RE.pattern]
@@ -902,8 +1178,119 @@ def check_python_code(code, argv_rest, ctx):
         if m.group(0).startswith("."):
             # Path('…').unlink() の形: 呼び出しの前の式(同じ行の、区切りまで)も見る
             line_start = code.rfind("\n", 0, m.start()) + 1
-            text = _tail_expr(code[line_start:m.start()]) + text
+            receiver = _tail_expr(code[line_start:m.start()])
+            text = receiver + text
+            target = receiver
+        else:
+            target = _py_first_arg(arg)
+        n = len(ctx.problems)
         _judge_py_expr(text, code, argv_rest, ctx, depth=0)
+        if len(ctx.problems) == n and not _py_known(target, code, 0):
+            ctx.problems.append(f"python で消す行き先が文字列のパスでない({(target or '').strip()[:60]})ので、"
+                                "行き先が分からない。'…' のような文字列のパスで書く")
+
+
+PY_STR_ONLY_RE = re.compile(r"""\s*(?:[rRuU]|[rR][bB]|[bB][rR]|[bB])?(['"])((?:\\.|(?!\1).)*)\1\s*""", re.S)
+PY_PATH_CALL_RE = re.compile(r"\s*(?:pathlib\.)?(?:Pure)?(?:Posix)?Path\s*\((.*)\)\s*", re.S)
+PY_NAME_RE = re.compile(r"\s*([A-Za-z_]\w*)\s*")
+PY_ARGV_RE = re.compile(r"\s*sys\.argv\s*\[\s*-?\d+\s*\]\s*")
+PY_PATH_KW = ("path", "name", "src", "file", "filename", "fspath")
+
+
+def _split_top(arg):
+    """かっこと引用符の外のカンマで分ける"""
+    parts, depth, quote, cur, i = [], 0, None, [], 0
+    while i < len(arg):
+        c = arg[i]
+        if quote:
+            cur.append(c)
+            if c == "\\" and i + 1 < len(arg):
+                cur.append(arg[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+            cur.append(c)
+        elif c in "([{":
+            depth += 1
+            cur.append(c)
+        elif c in ")]}":
+            depth -= 1
+            cur.append(c)
+        elif c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    return parts
+
+
+def _py_first_arg(arg):
+    """shutil.rmtree(p, ignore_errors=True) の p のように、消す行き先の引数を取り出す"""
+    parts = _split_top(arg)
+    for p in parts:
+        m = re.match(r"\s*([A-Za-z_]\w*)\s*=(?!=)(.*)$", p, re.S)
+        if not m:
+            return p
+        if m.group(1) in PY_PATH_KW:
+            return m.group(2)
+    return None
+
+
+def _py_known(expr, code, depth):
+    """消す行き先の式が、文字列のパス・Path('…')・一時フォルダ・sys.argv[n](またはそれを入れた変数)だけか。
+    os.path.join(…)・連結・f 文字列・ループの変数など、組み立てた行き先は分からないとする"""
+    if expr is None:
+        return False
+    e = expr.strip()
+    while e.startswith("(") and e.endswith(")") and len(_split_top(e[1:-1])) == 1 and _balanced(e[1:-1]):
+        e = e[1:-1].strip()
+    if not e:
+        return False
+    if PY_HOME_RE.search(e):
+        return True  # ホームの下を消す形は _judge_py_expr が止める
+    if PY_TEMP_RE.search(e) and re.fullmatch(r"[\w.]*\([^()]*\)", e):
+        return True  # tempfile.mkdtemp() そのもの
+    if PY_STR_ONLY_RE.fullmatch(e) or PY_ARGV_RE.fullmatch(e):
+        return True
+    m = PY_PATH_CALL_RE.fullmatch(e)
+    if m and _balanced(m.group(1)):
+        inner = _split_top(m.group(1))
+        return len(inner) == 1 and _py_known(inner[0], code, depth)
+    m = PY_NAME_RE.fullmatch(e)
+    if m and depth < 4:
+        name = re.escape(m.group(1))
+        found = False
+        # 名前を決める所: 代入(; のあとも)・with … as 名前
+        for am in re.finditer(rf"(?m)(?:^|;)\s*{name}\s*(=(?!=)|[-+*/%|&]=)\s*([^;\n]+)", code):
+            if am.group(1) != "=":
+                return False  # d += '/x' のように足して変える
+            found = True
+            if not _py_known(am.group(2), code, depth + 1):
+                return False
+        for am in re.finditer(rf"(?m)^[^\n#]*\bas\s+{name}\b", code):
+            found = True
+            if not PY_TEMP_RE.search(am.group(0)):
+                return False
+        if re.search(rf"\bfor\s+[^\n;]*\b{name}\b[^\n;]*\bin\b|\bdef\s+\w+\s*\([^)]*\b{name}\b|"
+                     rf"\b{name}\s*:=|\bimport\b[^\n;]*\b{name}\b|\bglobal\b[^\n;]*\b{name}\b", code):
+            return False  # ループの変数・関数の引数・:=・import した名前は、中身を追えない
+        return found
+    return False
+
+
+def _balanced(s):
+    depth = 0
+    for c in STR_LIT_RE.sub("''", s):
+        depth += {"(": 1, ")": -1}.get(c, 0)
+        if depth < 0:
+            return False
+    return depth == 0
 
 
 def _tail_expr(before):
@@ -964,7 +1351,12 @@ def check_script_file(path_word, args, ctx, lang, unknown_is_problem=False):
             text = f.read(1_000_000)
     except OSError:
         return
-    deletes = PY_DELETE_RE.search(text) if lang == "py" else (SH_DELETE_RE.search(text) or PY_DELETE_RE.search(text))
+    if lang == "interp":
+        deletes = INTERP_DELETE_RE.search(text)
+    elif lang == "py":
+        deletes = PY_DELETE_RE.search(text)
+    else:
+        deletes = SH_DELETE_RE.search(text) or PY_DELETE_RE.search(text)
     if not deletes:
         return
     for a in args:
@@ -1015,6 +1407,8 @@ def parse_python_args(args):
         a = args[i]
         if a == "-":
             return "stdin", None, args[i + 1:]
+        if a in ("-V", "-VV", "--version", "-h", "--help", "-?"):
+            return "none", None, []  # 版や使い方を出すだけで、コードは読まない
         if a == "--" or not a.startswith("-") or a.startswith("--"):
             if a.startswith("--") and a != "--":
                 i += 1
@@ -1125,6 +1519,8 @@ def check_segment(seg, ctx, heredoc_body=None):
         return
     if name in RM_NAMES:
         check_rm(name, args, ctx)
+    elif name in ("ln", "gln"):
+        check_ln(args, ctx)
     elif name == "mv":
         check_mv(args, ctx)
     elif name == "find":
@@ -1157,6 +1553,8 @@ def check_segment(seg, ctx, heredoc_body=None):
             check_script_file(infile, [], ctx, "sh", unknown_is_problem=True)
         else:
             ctx.problems.append(f"{name} が標準入力(| {name} など)から読むコマンドは、中身を確かめられない")
+    elif _interp_name(name) or name == "deno":
+        check_interp(name, args, ctx, heredoc_body, here, infile)
     elif PYTHONS_RE.match(name):
         kind, body, rest = parse_python_args(args)
         if kind == "code":
@@ -1192,7 +1590,7 @@ def judge_command(cmd, ctx):
     try:
         toks = tokenize(main)
     except ValueError:
-        if delete_hint(main):
+        if _risky(main):
             ctx.problems.append("コマンドが読めない(引用符が閉じていない)ので、消す処理の行き先を確かめられない")
         return
     stack = []
@@ -1217,10 +1615,11 @@ def judge_command(cmd, ctx):
 def judge(command, cwd, project_dir, home, temp_roots, env=None, repo_of=None):
     """問題の一覧を返す(空なら通す)。ファイルは消さない・書かない"""
     ctx = Ctx(project_dir, home, temp_roots, cwd, env, repo_of)
+    ctx.full_cmd = command
     try:
         judge_command(decode_ansi_c(command), ctx)
     except Exception as e:  # 読み違いで素通りさせない
-        if delete_hint(command):
+        if _risky(command):
             return [f"確かめに失敗した({type(e).__name__})ので止める"]
         return []
     seen, out = set(), []
@@ -1272,10 +1671,23 @@ def default_temp_roots(env):
 
 
 def main():
+    """想定外の例外で落ちると exit 1 になり、Claude Code はコマンドを止めない(公式: exit 2 だけがブロック)。
+    なので判定の全体を包み、落ちたら理由を出して exit 2 にする"""
+    try:
+        return _main()
+    except Exception as e:
+        sys.stderr.write(f"{MSG}: hook が確かめる途中で失敗した({type(e).__name__}: {e})ので、止める。{HINT}\n")
+        return 2
+
+
+def _main():
     try:
         data = json.load(sys.stdin)
     except Exception:
         sys.stderr.write(f"{MSG}: hook への入力が読めないので、行き先を確かめられない。止める\n")
+        return 2
+    if not isinstance(data, dict):
+        sys.stderr.write(f"{MSG}: hook への入力の形が違うので、行き先を確かめられない。止める\n")
         return 2
     # Monitor も Bash と同じくシェルのコマンドを動かす(公式 tools-reference)
     if data.get("tool_name") not in ("Bash", "Monitor"):
