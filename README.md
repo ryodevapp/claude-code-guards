@@ -1,8 +1,8 @@
 # claude-code-guards
 
-Claude Code を auto モードで動かしていたあいだに、Mac のホームディレクトリの中のファイルがまとめて消えました。そのあとに足した PreToolUse の hook 2つとテスト、サンドボックスと deny ルールの設定例です。何が起きたかと、各層が**防げないもの**は記事に書いています: {{ZENN_URL}}
+Claude Code を auto モードで動かしていたあいだに、Mac のホームディレクトリの中のファイルがまとめて消えました。そのあとに足した PreToolUse の hook 2つとテスト、サンドボックスと deny ルールの設定例です。何が起きたかと、各層が**防げないもの**は記事に書いています: https://zenn.dev/ryodevapp/articles/claude-code-home-deleted-guards
 
-{{WHO_LINE}}
+書いた人: IT企業で PM をしながら、Claude Code で iOS アプリを3本作っています。
 
 ## 必要なもの
 
