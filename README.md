@@ -117,6 +117,8 @@ printf '{"tool_name":"Bash","cwd":"%s","tool_input":{"command":"rm -rf ~"}}' "$P
 
 ## English
 
+Full English README: [README.en.md](README.en.md)
+
 Two PreToolUse hooks, tests, and example settings for Claude Code, written after an auto-mode session wiped much of my home directory.
 
 - `guard-delete` (Bash and Monitor) blocks (exit 2) commands that delete or move files outside two places: the git repository containing the command's working directory, and the temp directories. It also blocks commands whose target it cannot resolve, unreadable hook input, the main git commands that discard uncommitted work or unmerged commits, and risky forms of commands that run outside the sandbox (`git push` to anything but a remote name or a GitHub URL, `xcrun simctl spawn`, destructive `gh` subcommands, `gh repo clone -- <git args>`, and `git push`/`xcodebuild`/git-running `gh` subcommands outside real repositories directly under `~/Projects`).
