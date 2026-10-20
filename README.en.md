@@ -6,7 +6,7 @@ Two PreToolUse hooks for Claude Code that block deleting or writing files outsid
 
 While I was running Claude Code in auto mode, many files in my Mac's home directory were deleted at once. This repository contains the two PreToolUse hooks and tests I added afterward, plus example settings for the sandbox and deny rules. What happened, and what each layer **cannot prevent**, is covered in this article (Japanese): https://zenn.dev/ryodevapp/articles/claude-code-home-deleted-guards
 
-About the author: I work as a PM at an IT company and build three iOS apps with Claude Code.
+About the author: I work as a PM at an IT company and build three iOS apps with Claude Code, including [LifeCounter](https://apps.apple.com/us/app/lifecounter-question-journal/id6761015343?pt=375608344&ct=github&mt=8).
 
 ## Requirements
 

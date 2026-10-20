@@ -2,7 +2,7 @@
 
 Claude Code を auto モードで動かしていたあいだに、Mac のホームディレクトリの中のファイルがまとめて消えました。そのあとに足した PreToolUse の hook 2つとテスト、サンドボックスと deny ルールの設定例です。何が起きたかと、各層が**防げないもの**は記事に書いています: https://zenn.dev/ryodevapp/articles/claude-code-home-deleted-guards
 
-書いた人: IT企業で PM をしながら、Claude Code で iOS アプリを3本作っています。
+書いた人: IT企業で PM をしながら、Claude Code で iOS アプリを3本作っています([ことばめくり](https://apps.apple.com/jp/app/apple-store/id6813135588?pt=375608344&ct=github&mt=8)・[LifeCounter](https://apps.apple.com/jp/app/apple-store/id6761015343?pt=375608344&ct=github&mt=8) など)。
 
 ## 必要なもの
 
